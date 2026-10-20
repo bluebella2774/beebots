@@ -73,6 +73,24 @@ services:
       BEE3_OKX_API_KEY: ${BEE3_OKX_API_KEY:-}
       BEE3_OKX_API_SECRET: ${BEE3_OKX_API_SECRET:-}
       BEE3_OKX_API_PASSPHRASE: ${BEE3_OKX_API_PASSPHRASE:-}
+      # Exchange. okx (default) keeps the original behaviour. hyperliquid: see README "Run on Hyperliquid testnet".
+      # Hostinger Docker Manager only passes variables named here, so the Hyperliquid ones are listed too.
+      EXCHANGE: ${EXCHANGE:-okx}
+      HL_NETWORK: ${HL_NETWORK:-testnet}
+      HL_IOC_SLIPPAGE_BPS: ${HL_IOC_SLIPPAGE_BPS:-100}
+      HL_BOOK_COINS: ${HL_BOOK_COINS:-24}
+      BEE1_HL_TESTNET_ACCOUNT: ${BEE1_HL_TESTNET_ACCOUNT:-}
+      BEE1_HL_TESTNET_AGENT_KEY: ${BEE1_HL_TESTNET_AGENT_KEY:-}
+      BEE2_HL_TESTNET_ACCOUNT: ${BEE2_HL_TESTNET_ACCOUNT:-}
+      BEE2_HL_TESTNET_AGENT_KEY: ${BEE2_HL_TESTNET_AGENT_KEY:-}
+      BEE3_HL_TESTNET_ACCOUNT: ${BEE3_HL_TESTNET_ACCOUNT:-}
+      BEE3_HL_TESTNET_AGENT_KEY: ${BEE3_HL_TESTNET_AGENT_KEY:-}
+      BEE1_HL_ACCOUNT: ${BEE1_HL_ACCOUNT:-}
+      BEE1_HL_AGENT_KEY: ${BEE1_HL_AGENT_KEY:-}
+      BEE2_HL_ACCOUNT: ${BEE2_HL_ACCOUNT:-}
+      BEE2_HL_AGENT_KEY: ${BEE2_HL_AGENT_KEY:-}
+      BEE3_HL_ACCOUNT: ${BEE3_HL_ACCOUNT:-}
+      BEE3_HL_AGENT_KEY: ${BEE3_HL_AGENT_KEY:-}
       # Inside the compose network only; the port is never published. Caddy is the only way in.
       ENGINE_BIND: 0.0.0.0
       ENGINE_PORT: "8080"

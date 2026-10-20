@@ -18,6 +18,7 @@ import { log } from "./log.js";
 import { BIZZY_BREAKOUT_COINS } from "./bees/bizzy.js";
 import { BREEZY_COINS } from "./bees/breezy.js";
 import { deriveStyle } from "./bees/custom.js";
+import { fetchHlCoins } from "./hl/sdk.js";
 import { fetchXperpCoins } from "./okx/public.js";
 import { checkOpenAiKey, designBee, OpenAiError, paintBee, type BeeDesign } from "./openai.js";
 import { safeError } from "./redact.js";
@@ -42,6 +43,8 @@ export interface SetupOpts {
   onSaved: () => void;
   /** OKX EEA public REST base, for the live coin list. */
   okxApiBase: string;
+  /** Which exchange Setup checks coins against. Defaults to OKX. Hyperliquid uses mainnet public names (paper's market). */
+  exchange?: "okx" | "hyperliquid";
   /** Minutes after the engine starts that Setup stays open (SETUP_WINDOW_MIN). */
   windowMin: number;
   now?: () => number;
@@ -66,18 +69,27 @@ const reservedMsg = (name: string) =>
   `"${name}" belongs to one of the official bees (${STYLES.map((s) => STYLE_INFO[s].name).join(", ")}). Pick another name.`;
 
 /**
- * Checks a design from the model: coins must be on OKX's live list (unknown ones are dropped; if none are left, the
+ * Checks a design from the model: coins must be on the venue's live list (unknown ones are dropped; if none are left, the
  * owner is asked to rephrase), the brain is forced to one that can trade those coins, reserved names are refused.
+ * Matching is case-insensitive and keeps the venue's own spelling (`kPEPE` stays `kPEPE`).
  */
-export function finishDesign(raw: BeeDesign, known: string[]): BeeDesign {
+export function finishDesign(raw: BeeDesign, known: string[], where = "OKX EEA"): BeeDesign {
   const name = raw.name.replace(/[^\p{L}\p{N} .'_-]/gu, "").replace(/\s+/g, " ").trim().slice(0, 24);
   if (!name) throw new DesignError("The designer didn't come up with a name. Press Create again.");
   if (isReservedName(name)) throw new DesignError(`${reservedMsg(name)} Press Create again.`);
-  const set = new Set(known);
+  const byUpper = new Map<string, string>();
+  for (const k of known) {
+    const canonical = k.trim();
+    const upper = canonical.toUpperCase();
+    if (upper && !byUpper.has(upper)) byUpper.set(upper, canonical);
+  }
   const asked = [...new Set(raw.coins.map((c) => c.trim().toUpperCase().replace(/-.*$/, "")).filter(Boolean))];
-  const coins = asked.filter((c) => set.has(c)).slice(0, 20);
+  const coins = asked.flatMap((c) => {
+    const hit = byUpper.get(c);
+    return hit ? [hit] : [];
+  }).slice(0, 20);
   if (asked.length && !coins.length) {
-    throw new DesignError(`${asked.slice(0, 5).join(", ")} ${asked.length > 1 ? "aren't" : "isn't"} tradable on OKX EEA right now. Try describing your bee again with a coin like BTC, ETH, SOL or DOGE.`);
+    throw new DesignError(`${asked.slice(0, 5).join(", ")} ${asked.length > 1 ? "aren't" : "isn't"} tradable on ${where} right now. Try describing your bee again with a coin like BTC, ETH, SOL or DOGE.`);
   }
   const rules = raw.rules.replace(/\s+/g, " ").trim().slice(0, 500);
   if (rules.length < 10) throw new DesignError("The designer didn't write any rules. Press Create again.");
@@ -157,16 +169,20 @@ export class Setup {
     this.openedAt = this.now();
     this.checkJev = o.checkJev ?? checkJevKey;
     this.checkGemini = o.checkGemini ?? ((key, model) => checkGeminiKey(key, model));
-    this.listCoins = o.listCoins ?? (() => fetchXperpCoins(o.okxApiBase));
+    this.listCoins = o.listCoins ?? (() => (o.exchange === "hyperliquid" ? fetchHlCoins(false) : fetchXperpCoins(o.okxApiBase)));
     this.design = o.design ?? designBee;
     this.paint = o.paint ?? paintBee;
   }
 
-  /** OKX's live crypto X-Perp coins, cached for a few minutes. */
+  private venueName(): string {
+    return this.o.exchange === "hyperliquid" ? "Hyperliquid" : "OKX";
+  }
+
+  /** Live crypto perp coins for the selected exchange, cached for a few minutes. */
   private async coinList(): Promise<string[]> {
     if (this.coins && Date.now() - this.coins.at < COINS_TTL_MS) return this.coins.list;
     const list = await this.listCoins();
-    if (!list.length) throw new Error("OKX sent an empty coin list");
+    if (!list.length) throw new Error(`${this.venueName()} sent an empty coin list`);
     this.coins = { at: Date.now(), list };
     return list;
   }
@@ -287,11 +303,12 @@ export class Setup {
         try {
           known = await this.coinList();
         } catch (err) {
-          log.warn("OKX coin list failed", { err: safeError(err) });
-          return send(res, 502, { error: "Couldn't read OKX's coin list just now. Try again in a minute." });
+          log.warn("coin list failed", { exchange: this.o.exchange ?? "okx", err: safeError(err) });
+          return send(res, 502, { error: `Couldn't read ${this.venueName()}'s coin list just now. Try again in a minute.` });
         }
         this.designs++;
-        const d = finishDesign(await this.design(key, this.o.openai.textModel, description, known), known);
+        const where = this.o.exchange === "hyperliquid" ? "Hyperliquid" : "OKX EEA";
+        const d = finishDesign(await this.design(key, this.o.openai.textModel, description, known), known, where);
         return send(res, 200, { ...d, styleLabel: STYLE_INFO[d.baseStyle].label });
       }
 
@@ -325,11 +342,12 @@ export class Setup {
         if (!b.geminiKey && !b.jevKey) return send(res, 400, { error: "Your bees need a Gemini key (or a Jev key) to make their calls." });
         const keyErr = b.geminiKey ? await this.checkGemini(b.geminiKey, this.o.geminiModel) : await this.checkJev(b.jevKey!, this.o.jevModel);
         if (keyErr) return send(res, 400, { error: keyErr });
-        // The page's coins and style are re-checked here: coins against OKX's list (when it can be read), the style
-        // against the coins.
+        // The page's coins and style are re-checked here: coins against the venue's list (when it can be read), the style
+        // against the coins. Settings store tickers in uppercase; Hyperliquid names like kPEPE still match.
         const known = await this.coinList().catch(() => null);
+        const knownUpper = known ? new Set(known.map((c) => c.toUpperCase())) : null;
         const bees = b.bees.map((bee) => {
-          const coins = known ? bee.coins.filter((c) => known.includes(c)) : bee.coins;
+          const coins = knownUpper ? bee.coins.filter((c) => knownUpper.has(c.toUpperCase())) : bee.coins;
           return { ...bee, coins, style: deriveStyle(bee.style, coins), image: true };
         });
         const s: Settings = {

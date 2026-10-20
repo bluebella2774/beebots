@@ -14,6 +14,8 @@ import { effectiveCoins, liveRules } from "./lab/brain.js";
 import { LAB_MIN_INTERVAL_MS, LabDoor } from "./lab/door.js";
 import { LabStore } from "./lab/store.js";
 import { OkxExecutor, SimExecutor, type Executor } from "./exec/executor.js";
+import { HL_FUNDING_HISTORY_POINTS } from "./funding.js";
+import { createHyperliquidRuntime } from "./hl/sdk.js";
 import { Jev } from "./jev.js";
 import { log, setLogLevel } from "./log.js";
 import { MarketFeed } from "./market/data.js";
@@ -70,6 +72,7 @@ function runSetup() {
     refDir: REF_DIR,
     windowMin: Math.max(1, Number(env.SETUP_WINDOW_MIN) || 120),
     okxApiBase: env.OKX_API_BASE?.trim().replace(/\/+$/, "") || "https://eea.okx.com",
+    exchange: env.EXCHANGE?.trim() === "hyperliquid" ? "hyperliquid" : "okx",
     onSaved: () => {
       log.info("settings saved; exiting so Docker restarts the engine with them");
       process.exit(0);
@@ -94,22 +97,22 @@ async function main() {
     throw err;
   }
   setLogLevel(cfg.logLevel);
-  log.info("beebots engine starting", { mode: cfg.mode, tickMs: cfg.tickMs, dataRefreshMs: cfg.dataRefreshMs, chooser: cfg.jev.provider, model: cfg.jev.model });
+  log.info("beebots engine starting", { mode: cfg.mode, exchange: cfg.exchange, hlNetwork: cfg.exchange === "hyperliquid" ? cfg.hl.network : undefined, tickMs: cfg.tickMs, dataRefreshMs: cfg.dataRefreshMs, chooser: cfg.jev.provider, model: cfg.jev.model });
 
   const db = new Db(cfg.dbPath);
   const bus = new EventBus(db);
   const alerts = new Alerts(cfg.alertWebhookUrl);
-  const cli = createOkxCli({ site: cfg.okx.site, timeoutMs: cfg.okx.cliTimeoutMs });
-  // Public market data runs in-process on the kit's REST client; the CLI (one child process per call) is kept for
-  // the signed per-bee calls only.
-  const api = createPublicApi(cfg.okx.apiBase, cfg.mode === "demo", createOkxPublicRest({ apiBase: cfg.okx.apiBase, timeoutMs: cfg.okx.cliTimeoutMs }));
   const demo = cfg.mode === "demo";
-
+  const cli = cfg.exchange === "okx" ? createOkxCli({ site: cfg.okx.site, timeoutMs: cfg.okx.cliTimeoutMs }) : null;
+  // Public market data runs in-process. OKX uses the kit's REST client. Hyperliquid uses one cached metaAndAssetCtxs.
+  // Paper on Hyperliquid reads mainnet public prices and does not sign. Demo signs against testnet only.
   let engine: Engine | null = null;
   const held = () => (engine ? BEES.map((id) => engine!.bees[id]?.position?.instId).filter((x): x is string => !!x) : []);
-  // News needs a key: borrow the first Momentum bee's (demo/live only).
+  const hl = cfg.exchange === "hyperliquid" ? createHyperliquidRuntime({ infoTestnet: cfg.hl.infoTestnet, bookCoinLimit: cfg.hl.bookCoinLimit, extraCoins: () => ["BTC", "ETH", ...held().map((id) => id.split("-")[0]!)] }) : null;
+  const api = hl ? hl.api : createPublicApi(cfg.okx.apiBase, demo, createOkxPublicRest({ apiBase: cfg.okx.apiBase, timeoutMs: cfg.okx.cliTimeoutMs }));
+  // News needs a key: borrow the first Momentum bee's (OKX demo/live only). Hyperliquid has no news feed; boozy uses volume.
   const newsCreds = BEES.filter((b) => cfg.slots[b].style === "boozy").map((b) => cfg.creds[b]).find((c) => !!c);
-  const news = cfg.mode !== "dry" && newsCreds ? createNewsSource(cli, newsCreds, demo) : null;
+  const news = cli && cfg.mode !== "dry" && newsCreds ? createNewsSource(cli, newsCreds, demo) : null;
   const feed = new MarketFeed(
     api,
     {
@@ -117,6 +120,7 @@ async function main() {
       allowNonCrypto: cfg.universe.allowNonCrypto,
       spreadGateBps: Math.max(...STYLES.map((s) => cfg.bees[s].spreadGateBps)),
       trendCoins: [...BREEZY_COINS],
+      fundingPoints: cfg.exchange === "hyperliquid" ? HL_FUNDING_HISTORY_POINTS : 90,
     },
     news,
     held,
@@ -125,7 +129,9 @@ async function main() {
   const exec: Executor =
     cfg.mode === "dry"
       ? new SimExecutor(() => feed.view(), cfg.risk.takerFeeRate)
-      : new OkxExecutor(cli, cfg.creds, demo, (id) => feed.view().instruments.get(id), cfg.risk.maxLeverage);
+      : hl
+        ? hl.executor({ orderTestnet: cfg.hl.orderTestnet, creds: cfg.hlCreds, leverage: cfg.risk.maxLeverage, slippageBps: cfg.hl.slippageBps, takerFeeRate: cfg.risk.takerFeeRate })
+        : new OkxExecutor(cli!, cfg.creds, demo, (id) => feed.view().instruments.get(id), cfg.risk.maxLeverage);
 
   const startOfDay = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
   // Today's chooser spend survives a restart: the decisions' recorded cost, or the reservation ledger (which also holds

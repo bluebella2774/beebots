@@ -32,7 +32,8 @@ export function customBrain(base: BeeBrain, o: CustomRules): BeeBrain {
   const rules = o.rules.trim();
   const coins = [...new Set(o.coins.map((c) => c.trim().toUpperCase()).filter(Boolean))];
   if (!rules && !coins.length) return base;
-  const allowed = (instId: string) => !coins.length || coins.includes(coinOf(instId));
+  // Case-insensitive so Hyperliquid's kPEPE matches a coin list stored as KPEPE.
+  const allowed = (instId: string) => !coins.length || coins.includes(coinOf(instId).toUpperCase());
 
   // The brain sees a market with only the allowed coins in it (plus whatever the bee holds, so it can manage it).
   const narrow = (ctx: BeeContext): BeeContext => {

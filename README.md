@@ -256,8 +256,9 @@ Opus 5.5 writes the rules.
 
 Your sentence becomes two things the engine enforces, and one it passes on:
 
-- **Coins.** If your bee names coins, it only ever trades those. They must be crypto perpetuals listed on OKX EEA right
-  now (Setup checks the live list and asks you to rephrase if none match).
+- **Coins.** If your bee names coins, it only ever trades those. They must be crypto perpetuals listed right now
+  (Setup checks the live list and asks you to rephrase if none match). On OKX that is the EEA X-Perp list. On
+  Hyperliquid (`EXCHANGE=hyperliquid`) it is the main perp list, including names like `kPEPE`.
 - **The engine it runs on.** Every bee runs on one of three built-in trading styles below. A bee limited to BTC and/or
   ETH can run on Trend; one limited to BTC, ETH, SOL, HYPE, XRP, SUI, DOGE or LINK can run on Breakout; everything else
   runs on Momentum, which works on any coin.
@@ -285,7 +286,8 @@ in [`strategies/`](strategies/), and the rules every bee shares (caps, stops) ar
 
 Every tick, for every bee:
 
-1. **Look.** Live OKX market data: tickers, candles, RSI, MACD, ATR, Bollinger, Donchian, funding, open interest.
+1. **Look.** Live market data: tickers, candles, RSI, MACD, ATR, Bollinger, Donchian, funding, open interest.
+   OKX by default. Hyperliquid when `EXCHANGE=hyperliquid` (paper still uses live prices; testnet is only for orders).
 2. **Summarise.** A small numeric snapshot of the market and the bee's own position.
 3. **Ask the model.** Gemini 4 Argon (or Jev) picks one move from a menu of moves that are actually valid right now.
    With Gemini, each bee asks at most once a minute. When the model is not asked or does not answer usefully, the code
@@ -337,6 +339,101 @@ Manager → the `engine` container's logs.
 **Backups:** a sidecar writes a nightly copy of each database to `/data/backups` inside the `bees-data` volume and
 keeps 7 days. That copy lives on the same server, so take an off-server copy yourself if you care about the history.
 
+## Run on Hyperliquid testnet
+
+BeeBots can trade Hyperliquid instead of OKX. **Paper trading stays the default.** With `EXCHANGE=hyperliquid` and
+`MODE=dry`, the bees use live Hyperliquid prices and simulated money. No wallet, no orders. OKX is unchanged when
+`EXCHANGE` is left as `okx` (or unset).
+
+The images published for the original project do not include this. On this fork, build them yourself:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+### 1. Create a testnet wallet
+
+1. Install a wallet such as MetaMask or Rabby, and create (or pick) an address you control.
+2. Open [Hyperliquid testnet](https://app.hyperliquid-testnet.xyz) and connect that address.
+3. The faucet will not send testnet USDC until **that same address has deposited on Hyperliquid mainnet at least once**.
+   A small mainnet deposit from this address unlocks the faucet. You can withdraw that deposit yourself afterwards.
+   This bot does not send it, and it does not trade mainnet unless you turn that on later by hand.
+4. On the testnet app, use the faucet and claim testnet USDC.
+
+### 2. Create an API wallet (one per bee)
+
+Still on the testnet app, create an API wallet (Hyperliquid calls this an agent wallet). It can place and cancel
+orders. It **cannot withdraw**.
+
+Make one for each bee that will trade (three if all three bees run). Copy two things into a password manager, not
+into git:
+
+- the **master account address** (`0x` and 40 hex characters) — the bot reads balances and positions from this
+- the **API wallet private key** (`0x` and 64 hex characters) — the bot signs orders with this
+
+### 3. Set the variables, paper first
+
+Create a `.env` file next to `docker-compose.yml` (the names are listed in [`.env.example`](.env.example)). Start in
+paper mode and watch the dashboard before any wallet is involved:
+
+```sh
+EXCHANGE=hyperliquid
+HL_NETWORK=testnet
+DRY_RUN=true
+MODE=dry
+```
+
+Restart so the new settings load:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+```
+
+Paper mode needs no Hyperliquid keys. `HL_NETWORK` defaults to `testnet` anyway. Mainnet trading is a separate switch,
+named `HL_NETWORK=mainnet`, and it does nothing unless you also set real-money mode (below). Leave it alone while you
+are learning.
+
+### 4. Then trade testnet
+
+When paper looks right, point orders at testnet. This is still fake USDC.
+
+```sh
+EXCHANGE=hyperliquid
+HL_NETWORK=testnet
+DRY_RUN=false
+MODE=demo
+BEE1_HL_TESTNET_ACCOUNT=0xYourMasterAddress
+BEE1_HL_TESTNET_AGENT_KEY=0xYourApiWalletPrivateKey
+# the same two variables for BEE2 and BEE3
+```
+
+On a host that only substitutes variables named in `docker-compose.yml` (Hostinger Docker Manager does this), set
+those names in the manager as well. They are already listed in this repo's compose file.
+
+Check the wallets without sending an order (testnet only, unless you also set `HL_KEYCHECK_MAINNET=yes`):
+
+```sh
+pnpm hl:keycheck
+```
+
+The account must be in Standard mode (not unified or portfolio margin), and each API wallet must show as approved.
+`MODE=demo` always uses testnet. Setting `HL_NETWORK=mainnet` together with `MODE=demo` makes the engine refuse to start.
+
+A few Hyperliquid rules the bees already follow, so you are not surprised:
+
+- Smallest order is **$10**. Anything smaller is skipped. Closes of a smaller leftover can still be sent.
+- Prices use 5 significant figures, and size uses the coin's `szDecimals` (so `kPEPE` is not the same as `PEPE`).
+- Funding is **every hour**, not three times a day.
+- Margin is USDC, isolated, and leverage stays capped at **2x**.
+- A "market" order is an immediate-or-cancel limit a short distance through the book (`HL_IOC_SLIPPAGE_BPS`, default 1%).
+
+### Real Hyperliquid money (don't, until you mean it)
+
+Real money needs **all** of: `EXCHANGE=hyperliquid`, `HL_NETWORK=mainnet`, `DRY_RUN=false`, `MODE=live`,
+`LIVE_ACK=I-ACCEPT-REAL-MONEY-RISK`, a Gemini or Jev key, and mainnet API wallets in `BEE1_HL_ACCOUNT` and
+`BEE1_HL_AGENT_KEY` (and the same for bee 2 and bee 3). Those names are different from the testnet ones, so a testnet
+key cannot sign a mainnet order. The same 2x cap, stops, daily loss stop and size ramp still apply.
+
 ## Real money (read this twice)
 
 beebots can trade OKX demo accounts or real money, but only if you set it up by hand. It is **not** part of Setup, and
@@ -360,7 +457,7 @@ Again: this is not financial advice, and you can lose everything.
 
 ```sh
 pnpm install
-pnpm test            # risk layer (every cap, gate and forced move, both directions), setup, redaction, indicators, ledger
+pnpm test            # risk layer (every cap, gate and forced move, both directions), setup, Hyperliquid adapter, redaction, indicators, ledger
 pnpm universe        # the tradable coin list from live public data (no keys)
 pnpm snapshot        # each style's menu and snapshot from live data (no model call)
 pnpm e2e:fake-jev    # the whole engine on paper with a random fake Jev (no spend)
