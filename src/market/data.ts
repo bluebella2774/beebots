@@ -22,6 +22,8 @@ export interface FeedOpts {
   spreadGateBps: number;
   /** Coins that always get stats + 4h trend data (breezy's majors). */
   trendCoins: string[];
+  /** Funding prints to request. OKX is 90 (30 days × 3). Hyperliquid is hourly, so this is a count of hours. */
+  fundingPoints?: number;
 }
 
 const HOUR = 3_600_000;
@@ -205,7 +207,7 @@ export class MarketFeed {
     const c = this.fundingHist.get(id);
     if (c && now - c.at < HOUR) return c.rates;
     try {
-      const rates = await this.api.fundingHistory(id, 90); // 30 days x 3 settlements
+      const rates = await this.api.fundingHistory(id, this.opts.fundingPoints ?? 90); // OKX: 30 days x 3 settlements
       this.fundingHist.set(id, { at: now, rates });
       return rates;
     } catch {

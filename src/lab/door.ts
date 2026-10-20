@@ -176,7 +176,7 @@ export class LabDoor {
     const rules = p.data.rules.replace(/\s+/g, " ").trim();
     if (rules.length < 10 || rules.length > 500) return { status: 400, body: { error: "rules must be 10-500 characters" } };
     const coins = [...new Set(p.data.coins.map((c) => c.trim().toUpperCase()))];
-    const known = new Set(this.d.knownCoins());
+    const known = new Set(this.d.knownCoins().map((c) => c.toUpperCase()));
     if (coins.length && !known.size) return { status: 503, body: { error: "coin list not loaded yet, try again shortly" } };
     const unknown = coins.filter((c) => !known.has(c));
     if (unknown.length) return { status: 400, body: { error: "not a live crypto X-Perp", coins: unknown.slice(0, 20) } };

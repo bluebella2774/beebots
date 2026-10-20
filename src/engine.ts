@@ -11,6 +11,7 @@ import type { EventBus } from "./events.js";
 import type { Executor } from "./exec/executor.js";
 import { contractsFor, roundToLot } from "./exec/sizing.js";
 import type { DecisionSource, FallbackReason, Jev, JevAnswer, JevResult } from "./jev.js";
+import { fundingHoursUtc, fundingPaymentUsd, fundingSlot } from "./funding.js";
 import { applyFill, applyFunding, freshBee, mark, rollDay, sizedRiskUsd } from "./ledger.js";
 import { log } from "./log.js";
 import type { MarketFeed } from "./market/data.js";
@@ -18,7 +19,6 @@ import { safeError } from "./redact.js";
 import { applyRisk, type JevStatus, type Proposal } from "./risk.js";
 import { buildSnapshot } from "./snapshot.js";
 
-const FUNDING_HOURS_UTC = [0, 8, 16];
 const RECON_MS = 5 * 60_000;
 /** How often a benched bee gets a live P&L row in the stream. */
 const PULSE_MS = 4_000;
@@ -92,6 +92,7 @@ export class Engine {
   private lastEquityAt = 0;
   private lastReconAt = 0;
   private lastFundingSlot: number;
+  private fundingHours: readonly number[];
   private seq = 0;
   private jevDownAlerted = false;
   private recon: { ok: boolean | null; detail: string; ts: number } = { ok: null, detail: "not run yet", ts: 0 };
@@ -108,7 +109,8 @@ export class Engine {
   constructor(private d: EngineDeps) {
     this.now = d.now ?? Date.now;
     this.startedAt = this.now();
-    this.lastFundingSlot = fundingSlot(this.startedAt);
+    this.fundingHours = fundingHoursUtc(d.cfg.exchange);
+    this.lastFundingSlot = fundingSlot(this.startedAt, this.fundingHours);
   }
 
   // ---------- lifecycle ----------
@@ -140,7 +142,7 @@ export class Engine {
     }
 
     await this.refreshMarket();
-    if (this.d.exec.kind === "okx") await this.reconcile();
+    if (this.d.exec.kind !== "sim") await this.reconcile();
 
     this.d.bus.emit("status", { event: "engine_start", mode: cfg.mode, tickMs: cfg.tickMs });
     this.d.alerts.send(`engine started (MODE=${cfg.mode})`);
@@ -179,7 +181,7 @@ export class Engine {
     try {
       await this.d.feed.refresh(this.now());
       this.rankBoozyHourly();
-      if (this.d.exec.kind === "okx") await this.pollFunding();
+      if (this.d.exec.kind !== "sim") await this.pollFunding();
     } catch (err) {
       log.warn("market refresh failed", { err: safeError(err) });
     } finally {
@@ -216,7 +218,7 @@ export class Engine {
         }
       }
       this.d.bus.emit("equity", { bees: BEES.map((id) => this.publicBee(id)) }, now);
-      if (this.d.exec.kind === "okx" && now - this.lastReconAt >= RECON_MS) await this.reconcile();
+      if (this.d.exec.kind !== "sim" && now - this.lastReconAt >= RECON_MS) await this.reconcile();
       this.checkJevOutage(now);
     } finally {
       this.ticking = false;
@@ -728,9 +730,9 @@ export class Engine {
 
   // ---------- funding, reconciliation, ranks ----------
 
-  /** MODE=dry: charge funding at 00/08/16 UTC using the current rate (long pays a positive rate). */
+  /** MODE=dry: charge the venue's own funding rate once per settlement (OKX 00/08/16 UTC, Hyperliquid every hour). */
   private simulateFunding(now: number) {
-    const slot = fundingSlot(now);
+    const slot = fundingSlot(now, this.fundingHours);
     if (slot === this.lastFundingSlot) return;
     this.lastFundingSlot = slot;
     const view = this.d.feed.view();
@@ -740,7 +742,7 @@ export class Engine {
       const s = p ? view.stats.get(p.instId) : undefined;
       const inst = p ? view.instruments.get(p.instId) : undefined;
       if (!p || !s || !inst || s.fundingPct === null) continue;
-      const amount = -(p.side === "long" ? 1 : -1) * (s.fundingPct / 100) * positionNotional(p, s.mid, inst.ctVal);
+      const amount = fundingPaymentUsd(p.side, s.fundingPct / 100, positionNotional(p, s.mid, inst.ctVal));
       if (this.d.db.insertFunding(id, now, p.instId, amount, `sim-${id}-${slot}`)) {
         applyFunding(bee, amount);
         this.d.bus.emit("funding", { bee: id, coin: p.coin, amountUsd: Number(amount.toFixed(4)) }, now);
@@ -763,17 +765,18 @@ export class Engine {
     }
   }
 
-  /** Every 5 min (demo/live): our position and fees vs OKX. On mismatch, adopt OKX's position and go red. */
+  /** Every 5 min (demo/live): our position and fees vs the exchange. On mismatch, adopt the exchange position and go red. */
   async reconcile(): Promise<void> {
     const now = this.now();
     this.lastReconAt = now;
     const view = this.d.feed.view();
+    const venue = this.d.cfg.exchange === "hyperliquid" ? "Hyperliquid" : "OKX";
     const diffs: string[] = [];
     for (const id of BEES) {
       const bee = this.bees[id];
       const ex = await this.d.exec.positions(id);
       if (ex === null) {
-        diffs.push(`${this.d.cfg.slots[id].name}: could not read OKX positions`);
+        diffs.push(`${this.d.cfg.slots[id].name}: could not read ${venue} positions`);
         continue;
       }
       const theirs = ex[0];
@@ -782,7 +785,7 @@ export class Engine {
       const theirSigned = theirs?.pos ?? 0;
       const sameInst = (ours?.instId ?? null) === (theirs?.instId ?? null);
       let ok = ex.length <= 1 && sameInst && Math.abs(oursSigned - theirSigned) < 1e-9;
-      let detail = ok ? "match" : `ours ${ours ? `${ours.side} ${ours.contracts} ${ours.coin}` : "flat"} vs OKX ${theirs ? `${theirs.pos} ${theirs.instId.split("-")[0]}` : "flat"}`;
+      let detail = ok ? "match" : `ours ${ours ? `${ours.side} ${ours.contracts} ${ours.coin}` : "flat"} vs ${venue} ${theirs ? `${theirs.pos} ${theirs.instId.split("-")[0]}` : "flat"}`;
 
       // Fees to the cent on our recent filled orders.
       const rows = this.d.db.raw
@@ -795,13 +798,13 @@ export class Engine {
           const theirSum = [...theirFees.values()].reduce((a, b) => a + b, 0);
           if (Math.abs(ourSum - theirSum) >= 0.005) {
             ok = false;
-            detail += `; fees ours $${ourSum.toFixed(2)} vs OKX $${theirSum.toFixed(2)}`;
+            detail += `; fees ours $${ourSum.toFixed(2)} vs ${venue} $${theirSum.toFixed(2)}`;
           }
         }
       }
 
       if (!sameInst || Math.abs(oursSigned - theirSigned) >= 1e-9) {
-        // OKX is the truth: rebuild the position from it.
+        // The exchange is the truth: rebuild the position from it.
         if (!theirs) {
           bee.position = null;
           bee.flatSince ??= now;
@@ -831,7 +834,7 @@ export class Engine {
     }
     const ok = diffs.length === 0;
     const was = this.recon.ok;
-    this.recon = { ok, detail: ok ? "books match OKX" : diffs.join(" | "), ts: now };
+    this.recon = { ok, detail: ok ? `books match ${venue}` : diffs.join(" | "), ts: now };
     this.d.bus.emit("recon", { ok, detail: this.recon.detail }, now);
     if (!ok && was !== false) this.d.alerts.send(`reconciliation mismatch: ${this.recon.detail}`);
   }
@@ -978,13 +981,6 @@ export class Engine {
     const age = this.now() - this.d.feed.lastRefreshAt;
     return { ok: this.d.feed.lastRefreshAt > 0 && age < 5 * this.d.cfg.dataRefreshMs, mode: this.d.cfg.mode, closed: this.closedAt !== null, flat: BEES.every((id) => !this.bees[id].position), marketAgeMs: age, uptimeS: Math.round((this.now() - this.startedAt) / 1000) };
   }
-}
-
-function fundingSlot(ms: number): number {
-  const d = new Date(ms);
-  const h = d.getUTCHours();
-  const slotHour = [...FUNDING_HOURS_UTC].reverse().find((x) => h >= x) ?? 0;
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), slotHour);
 }
 
 function describeAction(a: Action): string {

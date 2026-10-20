@@ -44,7 +44,7 @@ describe("effective-config tool", () => {
     for (const b of ["BEE1", "BEE2", "BEE3"]) for (const f of ["KEY", "SECRET", "PASSPHRASE"]) env[`${b}_OKX_API_${f}`] = `${b}-${f}-value`;
     const out = JSON.stringify(effectiveConfig(composeEnv(env)));
     expect(out).not.toMatch(/-value/);
-    expect(JSON.parse(out).keys.bee3).toEqual({ okxLive: true, okxDemo: false });
+    expect(JSON.parse(out).keys.bee3).toEqual({ okxLive: true, okxDemo: false, hlTestnet: false, hlMainnet: false });
   });
 
   it("a clean env with the Gemini key matches Argon's intended config exactly", () => {

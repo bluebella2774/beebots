@@ -12,6 +12,8 @@ const DEFAULT_SLOTS: Record<BeeId, StyleId> = { bee1: "bizzy", bee2: "breezy", b
 export const LIVE_ACK_PHRASE = "I-ACCEPT-REAL-MONEY-RISK";
 
 export type Mode = "dry" | "demo" | "live";
+export type ExchangeId = "okx" | "hyperliquid";
+export type HlNetwork = "testnet" | "mainnet";
 
 const bool = (def: boolean) =>
   z
@@ -59,6 +61,13 @@ const perSlot = (prefix: string) => ({
   [`${prefix}_OKX_DEMO_API_SECRET`]: opt,
   [`${prefix}_OKX_DEMO_API_PASSPHRASE`]: opt,
 });
+// Per-bee Hyperliquid API wallets. Testnet (MODE=demo) and mainnet (MODE=live) are separate so a testnet key cannot sign mainnet.
+const perHl = (prefix: string) => ({
+  [`${prefix}_HL_ACCOUNT`]: opt,
+  [`${prefix}_HL_AGENT_KEY`]: opt,
+  [`${prefix}_HL_TESTNET_ACCOUNT`]: opt,
+  [`${prefix}_HL_TESTNET_AGENT_KEY`]: opt,
+});
 
 const EnvSchema = z.object({
   // DRY_RUN=true (the default) forces MODE=dry whatever MODE says. Going to demo or live needs both DRY_RUN=false and MODE set.
@@ -86,6 +95,15 @@ const EnvSchema = z.object({
   JEV_USD_PER_MTOK: num(0.042),
   TICK_MS: num(10_000),
   DATA_REFRESH_MS: num(60_000),
+
+  // okx keeps the original behaviour. hyperliquid is opt-in.
+  EXCHANGE: z.enum(["okx", "hyperliquid"]).optional().default("okx"),
+  // testnet is the default. mainnet is the only value that unlocks real Hyperliquid orders, and only together with MODE=live.
+  HL_NETWORK: z.enum(["testnet", "mainnet"]).optional().default("testnet"),
+  // IOC limit distance for Hyperliquid market orders, in basis points. Hard-capped at 5%.
+  HL_IOC_SLIPPAGE_BPS: num(100),
+  // How many of the busiest coins get a real bid/ask (l2Book). The rest fail the spread gate. Capped so one IP stays under the weight limit.
+  HL_BOOK_COINS: num(24),
 
   OKX_SITE: z.literal("eea").optional().default("eea"),
   OKX_API_BASE: str("https://eea.okx.com"),
@@ -117,6 +135,9 @@ const EnvSchema = z.object({
   ...perSlot("BEE1"),
   ...perSlot("BEE2"),
   ...perSlot("BEE3"),
+  ...perHl("BEE1"),
+  ...perHl("BEE2"),
+  ...perHl("BEE3"),
   // Real money needs DRY_RUN=false, MODE=live AND this set to LIVE_ACK_PHRASE. Paper trading needs none of it.
   LIVE_ACK: opt,
 
@@ -181,6 +202,15 @@ export interface OkxCreds {
   passphrase: string;
 }
 
+/** Master address plus an API-wallet key. The key cannot withdraw. Never logged. */
+export interface HlCreds {
+  account: `0x${string}`;
+  agentKey: `0x${string}`;
+}
+
+const isHexAddress = (v: string) => /^0x[0-9a-fA-F]{40}$/.test(v);
+const isHexKey = (v: string) => /^0x[0-9a-fA-F]{64}$/.test(v);
+
 /** A bee as the dashboard shows it. No secrets. */
 export interface SlotProfile {
   style: StyleId;
@@ -220,6 +250,12 @@ export interface Config {
   };
   tickMs: number;
   dataRefreshMs: number;
+  exchange: ExchangeId;
+  /**
+   * Hyperliquid network choice. `infoTestnet` is where public prices are read (paper reads mainnet; demo reads testnet).
+   * `orderTestnet` is where signed orders would go. Paper does not sign. Mainnet orders also require `network === "mainnet"`.
+   */
+  hl: { network: HlNetwork; infoTestnet: boolean; orderTestnet: boolean; slippageBps: number; bookCoinLimit: number };
   okx: { site: "eea"; apiBase: string; cliTimeoutMs: number };
   risk: {
     startEquityUsd: number;
@@ -240,6 +276,8 @@ export interface Config {
   boozy: { candidates: number };
   /** Per-bee OKX credentials for the current mode. Never logged, never sent to the dashboard. */
   creds: Partial<Record<BeeId, OkxCreds>>;
+  /** Per-bee Hyperliquid API wallets for the current mode. Never logged, never sent to the dashboard. */
+  hlCreds: Partial<Record<BeeId, HlCreds>>;
   server: { port: number; bind: string };
   dbPath: string;
   logLevel: "debug" | "info" | "warn" | "error";
@@ -300,6 +338,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
     throw new ConfigError(`MODE=live moves real money. Set LIVE_ACK=${LIVE_ACK_PHRASE} to confirm you accept the risk, or go back to DRY_RUN=true.`);
   }
 
+  const exchange: ExchangeId = e.EXCHANGE;
+  if (e.HL_IOC_SLIPPAGE_BPS <= 0 || e.HL_IOC_SLIPPAGE_BPS > 500) throw new ConfigError("HL_IOC_SLIPPAGE_BPS must be in (0, 500].");
+  if (!Number.isInteger(e.HL_BOOK_COINS) || e.HL_BOOK_COINS < 1 || e.HL_BOOK_COINS > 40) throw new ConfigError("HL_BOOK_COINS must be a whole number from 1 to 40.");
+  if (exchange === "hyperliquid" && mode === "live" && e.HL_NETWORK !== "mainnet") {
+    throw new ConfigError("Hyperliquid mainnet is off. MODE=live on Hyperliquid needs HL_NETWORK=mainnet (the default is testnet) as well as LIVE_ACK. No order was sent.");
+  }
+  if (exchange === "hyperliquid" && mode === "demo" && e.HL_NETWORK === "mainnet") {
+    throw new ConfigError("MODE=demo on Hyperliquid always uses testnet. Leave HL_NETWORK unset or set HL_NETWORK=testnet. HL_NETWORK=mainnet is only for MODE=live.");
+  }
+
   if (e.MAX_LEVERAGE > 2 || e.MAX_LEVERAGE <= 0) throw new ConfigError("MAX_LEVERAGE must be in (0, 2]. Hard rule 3.");
   if (e.MAX_FLAT_MINUTES < 0) throw new ConfigError("MAX_FLAT_MINUTES must be >= 0");
   if (e.BEEKEEPER_WEBHOOK_URL && !/^https:\/\//.test(e.BEEKEEPER_WEBHOOK_URL)) throw new ConfigError("BEEKEEPER_WEBHOOK_URL must start with https://");
@@ -319,7 +367,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
   });
 
   const creds: Partial<Record<BeeId, OkxCreds>> = {};
-  if (mode !== "dry") {
+  const hlCreds: Partial<Record<BeeId, HlCreds>> = {};
+  const badHl: string[] = [];
+  if (mode !== "dry" && exchange === "okx") {
     const infix = mode === "demo" ? "OKX_DEMO_API" : "OKX_API";
     for (const bee of BEES) {
       const p = bee.toUpperCase();
@@ -332,8 +382,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
       if (k && s && ph) creds[bee] = { apiKey: k, secretKey: s, passphrase: ph };
     }
   }
+  if (mode !== "dry" && exchange === "hyperliquid") {
+    const testnet = mode === "demo";
+    for (const bee of BEES) {
+      const p = bee.toUpperCase();
+      const acctName = testnet ? `${p}_HL_TESTNET_ACCOUNT` : `${p}_HL_ACCOUNT`;
+      const keyName = testnet ? `${p}_HL_TESTNET_AGENT_KEY` : `${p}_HL_AGENT_KEY`;
+      const acct = e[acctName] as string | undefined;
+      const key = e[keyName] as string | undefined;
+      if (!acct) missing.push(acctName);
+      else if (!isHexAddress(acct)) badHl.push(`${acctName} (must be a 0x address, 40 hex characters)`);
+      if (!key) missing.push(keyName);
+      else if (!isHexKey(key)) badHl.push(`${keyName} (must be a 0x private key, 64 hex characters)`);
+      if (acct && key && isHexAddress(acct) && isHexKey(key)) hlCreds[bee] = { account: acct as `0x${string}`, agentKey: key as `0x${string}` };
+    }
+  }
   if (missing.length) {
     throw new ConfigError(`MODE=${mode} needs these settings, which are blank or missing:\n  ${missing.join("\n  ")}`);
+  }
+  if (badHl.length) {
+    throw new ConfigError(`These Hyperliquid settings are not usable (names only, values are not shown):\n  ${badHl.join("\n  ")}`);
   }
 
   const knobs = (style: StyleId): BeeKnobs => {
@@ -382,6 +450,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
           },
     tickMs: Math.max(1000, e.TICK_MS),
     dataRefreshMs: Math.max(15_000, e.DATA_REFRESH_MS),
+    exchange,
+    hl: {
+      network: e.HL_NETWORK,
+      infoTestnet: mode === "demo",
+      orderTestnet: mode !== "live",
+      slippageBps: e.HL_IOC_SLIPPAGE_BPS,
+      bookCoinLimit: e.HL_BOOK_COINS,
+    },
     okx: { site: e.OKX_SITE, apiBase: e.OKX_API_BASE.replace(/\/+$/, ""), cliTimeoutMs: e.OKX_CLI_TIMEOUT_MS },
     risk: {
       startEquityUsd: e.BEE_START_EQUITY_USD,
@@ -392,7 +468,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
       maxFlatMinutes: e.MAX_FLAT_MINUTES,
       liveSizeMultiplier: e.LIVE_SIZE_MULTIPLIER,
       liveRampHours: e.LIVE_RAMP_HOURS,
-      takerFeeRate: e.TAKER_FEE_RATE,
+      // Hyperliquid's base taker fee is 0.045%. An explicit TAKER_FEE_RATE still wins, including on OKX.
+      takerFeeRate: (env.TAKER_FEE_RATE === undefined || env.TAKER_FEE_RATE.trim() === "") && exchange === "hyperliquid" ? 0.00045 : e.TAKER_FEE_RATE,
     },
     universe: { min24hVolUsd: e.MIN_24H_VOL_USD, allowNonCrypto: e.ALLOW_NON_CRYPTO },
     bees: { bizzy: knobs("bizzy"), breezy: knobs("breezy"), boozy: knobs("boozy") },
@@ -400,6 +477,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, settings: Setti
     bizzy: { sizeFraction: e.BIZZY_SIZE_FRACTION, universeSize: e.BIZZY_UNIVERSE_SIZE, timeStopMinutes: e.BIZZY_TIME_STOP_MINUTES },
     boozy: { candidates: e.BOOZY_CANDIDATES },
     creds,
+    hlCreds,
     server: { port: e.ENGINE_PORT, bind: e.ENGINE_BIND },
     dbPath: e.DB_PATH.replaceAll("{mode}", mode),
     logLevel: e.LOG_LEVEL,

@@ -9,6 +9,8 @@ export interface Instrument {
   minSz: number;
   tickSz: number;
   state: string;
+  /** Omitted on OKX. Hyperliquid instruments set this so the universe gate does not look for an X-Perp id. */
+  venue?: "okx" | "hyperliquid";
 }
 
 export interface Ticker {

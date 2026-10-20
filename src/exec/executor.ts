@@ -32,7 +32,7 @@ export interface FundingBill {
 }
 
 export interface Executor {
-  readonly kind: "sim" | "okx";
+  readonly kind: "sim" | "okx" | "hl";
   init(bee: BeeId): Promise<void>;
   market(bee: BeeId, req: OrderReq): Promise<OrderResult>;
   positions(bee: BeeId): Promise<ExchangePosition[] | null>;
